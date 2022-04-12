@@ -1,0 +1,334 @@
+################################################################################
+# Source layout
+################################################################################
+
+# - Versions:
+#    WRL LTS 21:
+#    - Yocto 3.3
+#    - Linux 5.10 (LTS)
+#    - GCC 10.x
+#
+#    TI Jacinto 7 SDK:
+#    - Yocto 3.1
+#    - Linux 5.10 (LTS)
+#
+# - Similar source layout
+
+# CVE:
+# - Complete list for LTS21: https://support2.windriver.com/index.php?page=cve&on=list&show=50&product_id=1&product_version%5B%5D=29&id_status%5B%5D=4&cve_id_filter=&s=&submit=#list
+# - Tracked internally by Wind River and pushed upstream
+# - Example:
+#   - CVE-2022-22817: https://support2.windriver.com/index.php?page=cve&on=view&id=CVE-2022-22817
+#   - layers/meta-openembedded/meta-python/recipes-devtools/python/python3-pillow/0001-Handle-case-where-path-count-is-zero.patch
+
+################################################################################
+# QEMU x86_64
+################################################################################
+
+#######################################
+# Build Linux
+#######################################
+
+# Get sources
+git clone -b WRLINUX_10_21_BASE https://github.com/WindRiver-Labs/wrlinux-x.git
+
+# List available machines (for reference)
+./wrlinux-x/setup.sh --list-machines
+
+# Set up the project to include the QEMU platform and Qt5 layer
+./wrlinux-x/setup.sh --machines qemux86-64 --layers meta-qt5
+
+# Create the project
+. oe-init-build-env
+
+# Configure: edit conf/local.conf to add/change variables
+# - Allow external downloads
+BB_NO_NETWORK = '0'
+# - Add more space to rootfs (in kB)
+IMAGE_ROOTFS_EXTRA_SPACE = "2097152"
+# - Disable multilibs (some recipes seem to insist on being built as lib32)
+MULTILIBS = ""
+# - Specify SDK machine (here: Linux) - https://docs.windriver.com/bundle/Wind_River_Linux_Platform_Developers_Guide_LTS_21/page/keg1628786933069.html
+SDKMACHINE = "x86_64"
+# - Add debugging and tracing
+WRTEMPLATE += "feature/debug feature/wr-ide-tools"
+EXTRA_IMAGE_FEATURES += "debug-tweaks ssh-server-openssh"
+WRTEMPLATE += "feature/lttng feature/sftp-server"
+EXTRA_IMAGE_FEATURES += "tools-profile"
+# - Add package management
+EXTRA_IMAGE_FEATURES += "package-management"
+
+# Build base image
+bitbake wrlinux-image-std
+
+#######################################
+# Running QEMU
+#######################################
+
+# Prerequisites:
+# - Need to make sure that Yocto environment variables are set up
+# - KVM acceleration:
+#   - User needs to be part of 'kvm' group - if not, do the following:
+#       $ sudo usermod -aG kvm `whoami`
+#     and log in again
+
+# Run QEMU with KVM support
+# - Note: making sure to have enough RAM allocated
+runqemu kvm qemuparams="-m 2048M"
+
+# Running QEMU with OpenGL acceleration
+sudo apt install mesa-common-dev    # Prerequisites for OpenGL display
+runqemu kvm gl sdl qemuparams="-m 2048M"
+
+# Connecting to the target
+# - Get IP on target (using "ip a"), e.g. 192.168.7.2
+# - Connect via SSH
+ssh root@192.168.7.2
+
+#######################################
+# Building and using an SDK
+#######################################
+
+# Standard SDK for Linux and Windows (configured in build)
+bitbake -c  populate_sdk wrlinux-image-std
+
+# Once the build completes, SDKs are available in the build directory
+# (tmp-glibc/deploy/sdk)
+#
+# This SDK is delivered as an installable shell script, e.g.
+# wrlinux-version-glibc-x86_64-qemux86_64-wrlinux-image-small-sdk.sh
+
+# Importing the SDK in Workbench:
+# - https://docs.windriver.com/bundle/Wind_River_Linux_Tutorial_Importing_Custom_SDK_into_Workbench_LTS_21/page/xlk1628807934175.html
+
+#######################################
+# Building and using an extended SDK
+# (for Linux only)
+#######################################
+
+# Build the extensible SDK 
+# - Note: takes a long time
+bitbake -c  populate_sdk_ext wrlinux-image-std
+
+# Set the environment
+# - Note: not to be done from a shell where an environment for bitbake has already been set up
+cd [SDK_INSTALL_DIR]
+. environment-setup-core2-64-wrs-linux
+
+# Build the image
+devtool build-image
+
+# Run the QEMU image (needs the image to be built)
+runqemu kvm qemuparams="-m 2048M"
+
+#######################################
+# Docker support
+#######################################
+
+# Configure: edit conf/local.conf to add/change variables
+# - Add docker support
+WRTEMPLATE += "feature/docker"
+
+# [TARGET]
+
+# Using Wind River Linux prebuilt image
+docker pull windriver/wrlx-image
+docker run -it windriver/wrlx-image /usr/bin/bash
+
+#######################################
+# Docker - local registry
+#######################################
+
+# 1) Set up container registry on host
+# - Reference: https://docs.docker.com/registry/deploying/
+
+# [HOST]
+DOCKER_REGISTRY_PORT=5000
+DOCKER_REGISTRY_CONTAINER_NAME=registry
+CONTAINER_IMAGE=ubuntu:16.04
+CONTAINER_CUSTOM_IMAGE=my-ubuntu
+docker run -d -p $DOCKER_REGISTRY_PORT:$DOCKER_REGISTRY_PORT --restart=always --name $DOCKER_REGISTRY_CONTAINER_NAME $DOCKER_REGISTRY_CONTAINER_NAME:2
+DOCKER_EXTERNAL_IP=`docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $DOCKER_REGISTRY_CONTAINER_NAME`
+docker pull $CONTAINER_IMAGE
+docker tag $CONTAINER_IMAGE $DOCKER_EXTERNAL_IP:$DOCKER_REGISTRY_PORT/$CONTAINER_CUSTOM_IMAGE
+docker push $DOCKER_EXTERNAL_IP:$DOCKER_REGISTRY_PORT/$CONTAINER_CUSTOM_IMAGE
+docker stop $DOCKER_REGISTRY_CONTAINER_NAME 
+docker rm $DOCKER_REGISTRY_CONTAINER_NAME
+
+# 2) Configure target
+
+# [TARGET]
+DOCKER_REGISTRY_PORT=5000
+DOCKER_EXTERNAL_IP=172.17.0.2   # IP of the registry container (see above)
+DOCKER_HOST_IP=172.17.0.1       # IP of the docker host (of the registry - needed for proper bridging)
+CONTAINER_CUSTOM_IMAGE=my-ubuntu    # Container image to pull (see above)
+
+# Allow to use insecure registries (i.e. without HTTPS certificates) for experimental setup
+# - Reference: https://docs.docker.com/registry/insecure/
+cat > /etc/docker/daemon.json  << EOF
+{ "insecure-registries":["$DOCKER_EXTERNAL_IP:$DOCKER_REGISTRY_PORT"] } 
+EOF
+
+# Configure routing to reach the registry container
+ip route add $DOCKER_HOST_IP dev eth0
+ip route add 172.17.0.0/24 via $DOCKER_HOST_IP dev eth0
+
+# Pull container from registry
+docker pull $DOCKER_EXTERNAL_IP:$DOCKER_REGISTRY_PORT/$CONTAINER_CUSTOM_IMAGE
+
+#######################################
+# Using Toaster
+#######################################
+
+# - Reference: https://docs.windriver.com/bundle/Wind_River_Linux_Tutorial_Using_the_Yocto_Project_Toaster_LTS_21/page/num1630424383509.html
+
+# 1) Starting Toaster
+# - Prerequisite: source build environment
+# - Local use
+. toaster start webport=127.0.0.1:8000
+# - External access
+. toaster start webport=0.0.0.0:8000
+
+# 2) Navigate to the following location to open Toaster: http://localhost:8000
+
+# 3) Stopping Toaster
+. toaster stop
+
+#######################################
+# Package management
+#######################################
+
+# Documentation
+# - https://windriver-be-prod.windriver.com/bundle/Wind_River_Linux_Tutorial_Managing_Packages_at_Run_Time_LTS_21/page/jir1630426797579.html
+
+# [HOST]
+
+# 1) Building createrepo
+# - For Ubuntu 20.04, since createrepo does not exist
+# - Reference: https://www.stableit.ru/2021/07/createrepo-on-ubuntu-2004.html
+# - Install prerequisites
+sudo apt install -y libcurl4-openssl-dev libbz2-dev libxml2-dev libssl-dev zlib1g-dev pkg-config libglib2.0-dev liblzma-dev libsqlite0-dev libsqlite3-dev librpm-dev libzstd-dev python3.9-dev cmake doxygen libmagic-dev
+# - Get sources
+mkdir createrepo_src && cd createrepo_src
+git clone https://github.com/rpm-software-management/createrepo_c
+# - Build
+cd createrepo_c && mkdir build && cd build
+cmake .. -DWITH_ZCHUNK=NO -DWITH_LIBMODULEMD=NO && make -j4
+export PATH=$PATH:`pwd`/src; alias createrepo=createrepo_c
+
+# 2) Create RPM repositories (from Yocto project)
+# - Note: if you have built createrepo_c on your own, make sure it is in the
+#   PATH and aliased as 'createrepo'
+cd build
+# - Create repo data
+cd tmp-glibc/deploy/rpm
+for d in */ ; do
+    echo "$d"
+    cd $d
+    createrepo .
+    cd -
+done
+# - Create repo configuration
+for d in */ ; do
+    d=`basename $d`
+    cd $d
+    cat > $d.repo << EOF
+[$d]
+name=$d Packages
+baseurl=file:///$d
+enabled=1
+gpgcheck=0
+EOF
+    cd -
+done
+
+# 3) Serve repository
+python3 -m http.server 8080
+
+# 4) Start from step #2 if updates are made to the repository (e.g. new packages)
+
+# [TARGET]
+
+# 1) Create repository configuration (tune variables according to setup)
+REPOSITORY_BASE_URL=http://192.168.7.1:8080
+REPOSITORY_NAME=core2_64
+mkdir -p /etc/yum.repos.d
+cat > /etc/yum.repos.d/oe-packages.repo << EOF
+[$REPOSITORY_NAME]
+name=$REPOSITORY_NAME Packages
+baseurl=$REPOSITORY_BASE_URL/$REPOSITORY_NAME
+enabled=1
+gpgcheck=0
+EOF
+
+# 2) Update repository
+dnf makecache
+
+# 3) Install/query packages, e.g.
+dnf install qt3d-examples
+dnf install "qt*examples"
+dnf repoquery -l qtwayland-examples
+
+#######################################
+# Graphics
+#######################################
+
+# Configure: edit conf/local.conf to add/change variables
+# - Add Wayland support
+DISTRO ?= "wrlinux-graphics"
+WRTEMPLATE += "feature/weston-demo"
+# - Qt 5 support (requires ./wrlinux-x/setup.sh [...] --layers meta-qt5)
+#   - Note: takes a long time to build (especially qtcreator)
+WRTEMPLATE += "feature/qtdemo feature/qtcreator"
+
+# Build image
+bitbake wrlinux-image-std
+
+# Running Weston
+weston
+# (Hit CTRL-ATL-Backspace to exit Weston)
+
+# Running Qt Creator (see Qt5 enablement)
+export QT_QPA_PLATFORM=wayland  # Note wayland-egl also works if GL acceleration is enabled in QEMU
+qtcreator
+
+################################################################################
+# TDA4
+################################################################################
+
+#######################################
+# Build Linux
+#######################################
+
+# Get sources
+git clone -b WRLINUX_10_21_BASE https://github.com/WindRiver-Labs/wrlinux-x.git
+
+# Set up the project to include the TDA4 platform
+./wrlinux-x/setup.sh --machines ti-j72xx
+
+# Create the project
+. oe-init-build-env
+
+# Configure: edit conf/local.conf to add/change variables
+# - Allow external downloads
+BB_NO_NETWORK ?= '0'
+# - Add GPU support
+DISTRO ?= "wrlinux-graphics"
+MACHINE_FEATURES += " gpu"
+PNWHITELIST_wr-ti-j72xx += 'img-pvr-sdk'
+PNWHITELIST_wr-ti-j72xx += 'ti-img-rogue-umlibs'
+
+# Build base image
+bitbake wrlinux-image-std
+
+################################################################################
+# Tips and tricks
+################################################################################
+
+# If you want to download for all recipes first, run the following:
+bitbake wrlinux-image-std --runall=fetch
+# General syntax is bitbake [target] --runall=[action]
+
+# Explicitly set number of parallel builds (e.g. 4)
+BB_NUMBER_THREADS=4 bibtbake [recipe]
+
